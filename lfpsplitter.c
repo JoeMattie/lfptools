@@ -36,8 +36,6 @@ typedef unsigned int uint32_t;
 #define snprintf _snprintf
 #endif
 
-// TODO: read directly from the file instead of copying to a string
-//       since camera backup files can be in the hundreds of megabytes
 static lfp_file_p lfp_create(const char *filename)
 {
     FILE *fp;
@@ -67,6 +65,81 @@ static int lfp_file_check(lfp_file_p lfp)
     if (lfp->len > sizeof(magic) && memcmp(lfp->data, magic, sizeof(magic)) == 0) return 1;
     return 0;
 }
+
+static lfp_section_p parse_filelist(char **lfp, int *in_len)
+{
+    char *ptr = *lfp;
+    int len = *in_len;
+    lfp_section_p section = calloc(1,sizeof(lfp_section_t));
+    if (!section) return NULL;
+    
+    // There may be some null region between sections
+    while (*ptr == '\0' && len) {
+        ptr++;
+        len--;
+    }
+    
+    if (len <= MAGIC_LENGTH+sizeof(uint32_t)+SHA1_LENGTH+BLANK_LENGTH) {
+        free(section);
+        return NULL;
+    }
+    
+    // Copy the magic type
+    memcpy(section->typecode, ptr, 4);
+    // Move past the magic and the first 4 bytes of 0s
+    ptr += MAGIC_LENGTH;
+    len -= MAGIC_LENGTH;
+    
+    // the length is stored as a big endian unsigned 32 bit int
+    section->len = ntohl(*(uint32_t *)ptr);
+    ptr += sizeof(uint32_t);
+    len -= sizeof(uint32_t);
+    
+    // copy and move past the sha1 string and the 35 byte empty space
+    memcpy(section->sha1, ptr, SHA1_LENGTH);
+    ptr += SHA1_LENGTH+BLANK_LENGTH;
+    len -= SHA1_LENGTH+BLANK_LENGTH;
+    
+    // make sure there exists as much data as the header claims
+    if (len < section->len) {
+        free(section);
+        return NULL;
+    }
+    
+    // just directly reference the existing buffer
+    section->data = ptr;
+    
+    ptr += section->len;
+    len -= section->len;
+    
+    *lfp = ptr;
+    *in_len = len;
+    
+    return section;
+}
+
+static char *converted_image(const unsigned char *data, int *datalen, int len)
+{
+    int filelen = 4*len/3;
+    const unsigned char *ptr = data;
+    unsigned short *image = (unsigned short*)malloc(filelen*sizeof(short));
+    unsigned short *start = image;
+    
+    if (!image) return NULL;
+    // Turn the 12 bits per pixel packed array into 16 bits per pixel
+    // to make it easier to import into other libraries
+    while (ptr < data+len) {
+        *image++ = (*ptr << 8) | (*(ptr+1) & 0xF0);
+        *image++ = ((*(ptr+1) & 0x0F) << 12) | (*(ptr+2) << 4);
+        
+        ptr += 3;
+    }
+    
+    *datalen = filelen;
+    
+    return (char *)start;
+}
+
 
 static lfp_section_p parse_section(char **lfp, int *in_len)
 {
@@ -120,52 +193,6 @@ static lfp_section_p parse_section(char **lfp, int *in_len)
     return section;
 }
 
-static char *depth_string(const char *data, int *datalen, int len)
-{
-    // make sure there is enough space for the ascii formatted floats
-    int filelen = 20*len/4;
-    char *depth = (char*)malloc(filelen);
-    char *start = depth;
-    int i = 0;
-    
-    if (!depth) return NULL;
-    depth[0] = '\0';
-    
-    for (i = 0; i < len/4; i++) {
-        char val[20];
-        int vallen = 0;
-        snprintf(val, 20, "%f\n",*(float *)(data+i*4));
-        vallen = strlen(val);
-        strncpy(depth, val, vallen);
-        depth += vallen;
-    }
-    
-    *datalen = depth-start;
-    
-    return start;
-}
-
-static char *converted_image(const unsigned char *data, int *datalen, int len)
-{
-    int filelen = 4*len/3;
-    const unsigned char *ptr = data;
-    unsigned short *image = (unsigned short*)malloc(filelen*sizeof(short));
-    unsigned short *start = image;
-    
-    if (!image) return NULL;
-    // Turn the 12 bits per pixel packed array into 16 bits per pixel
-    // to make it easier to import into other libraries
-    while (ptr < data+len) {
-        *image++ = (*ptr << 8) | (*(ptr+1) & 0xF0);
-        *image++ = ((*(ptr+1) & 0x0F) << 12) | (*(ptr+2) << 4);
-        
-        ptr += 3;
-    }
-    
-    *datalen = filelen;
-    
-    return (char *)start;
-}
 
 static int save_data(const char *data, int len, const char *filename)
 {
@@ -186,6 +213,7 @@ static int save_data(const char *data, int len, const char *filename)
     return 1;
 }
 
+
 // Try to figure out if the data represents an image, json, raw data, etc
 static void lfp_identify_section(lfp_file_p lfp, lfp_section_p section)
 {
@@ -193,7 +221,7 @@ static void lfp_identify_section(lfp_file_p lfp, lfp_section_p section)
     char *ptr = NULL;
     int quotecount = 0;
     section->name = (char*)malloc(STRING_LENGTH);
-
+    
     // Find the sha1 in the table of contents
     if ((ptr = strstr(lfp->table->data, section->sha1))) {
         // Move backwards to the corresponding name
@@ -225,6 +253,7 @@ static void lfp_identify_section(lfp_file_p lfp, lfp_section_p section)
         section->type = LFP_JSON;
 }
 
+
 static void lfp_parse_sections(lfp_file_p lfp)
 {
     char *ptr = lfp->data;
@@ -236,8 +265,6 @@ static void lfp_parse_sections(lfp_file_p lfp)
     
     // Assume the first section is always the table of contents
     lfp->table = parse_section(&ptr, &len);
-    lfp->table->type = LFP_JSON;
-    lfp->table->name = "table";
     
     lfp_section_p cur_section = NULL;
     while (len > 0) {
@@ -245,6 +272,7 @@ static void lfp_parse_sections(lfp_file_p lfp)
         if (!new_section) break;
         
         lfp_identify_section(lfp, new_section);
+
         
         if (!lfp->sections) lfp->sections = new_section;
         else if (cur_section) cur_section->next = new_section;
@@ -255,54 +283,91 @@ static void lfp_parse_sections(lfp_file_p lfp)
 static void lfp_save_sections(lfp_file_p lfp)
 {
     char name[STRING_LENGTH];
+    int sectioncount = 0;
     lfp_section_p section = lfp->sections;
     int jpeg = 0, raw = 0, text = 0;
     char *buf;
     int buflen = 0;
     
-    // Save the plaintext json metadata
-    snprintf(name, STRING_LENGTH, "%s_%s.json", lfp->filename, lfp->table->name);
-    if (save_data(lfp->table->data, lfp->table->len, name))
-        printf("Saved %s\n", name);
+    typedef char * string;
     
     while (section != NULL) {
-        switch (section->type) {
-            case LFP_RAW_IMAGE:
-                buf = converted_image((unsigned char *)section->data, &buflen, section->len);
-                if (buf) {
-                    snprintf(name, STRING_LENGTH, "%s_%s%d.raw", lfp->filename, section->name, raw++);
-                    if (save_data(buf, buflen, name))
-                        printf("Saved %s\n", name);
-                    free(buf);
-                }
-                break;
-            
-            case LFP_JSON:
-                snprintf(name, STRING_LENGTH, "%s_%s%d.json", lfp->filename, section->name, text++);
-                if (save_data(section->data, section->len, name))
-                    printf("Saved %s\n", name);
-                break;
-                
-            case LFP_DEPTH_LUT:
-                // Parse the depth lookup table and save as plaintext
-                buf = depth_string(section->data, &buflen, section->len);
-                if (buf) {
-                    snprintf(name, STRING_LENGTH, "%s_%s.txt", lfp->filename, section->name);
-                    if (save_data(buf, buflen, name))
-                        printf("Saved %s\n", name);
-                    free(buf);
-                }
-                break;
-                
-            case LFP_JPEG:
-                snprintf(name, STRING_LENGTH, "%s_%.2d.jpg", lfp->filename, jpeg++);
-                if (save_data(section->data, section->len, name))
-                    printf("Saved %s\n", name);
-                break;
-        }
-        
+        sectioncount++;
         section = section->next;
     }
+
+    section = lfp->sections;
+    
+
+    // Save the plaintext json metadata
+  //  snprintf(name, STRING_LENGTH, "%s_%s.json", lfp->filename, lfp->table->name);
+  //  if (save_data(lfp->table->data, lfp->table->len, name))
+  //      printf("Saved %s\n", name);
+
+    //********************************************************************************************************
+    //********************************************************************************************************
+    //********************************************************************************************************    
+    
+    string filenames[sectioncount];
+    string sha1s[sectioncount];
+	int i=0;
+    
+	for(i=0;i < sectioncount;++i) {
+        filenames[i] = malloc(STRING_LENGTH);
+        sha1s[i] = malloc(STRING_LENGTH);
+    }
+    
+    char *ptr = strstr(lfp->table->data,"name");
+    char *ptr2 = NULL;
+    
+    for(i=0; i<sectioncount; ++i)
+    {
+        while(*ptr != 'C') ptr++;
+        ptr2 = ptr+4;
+        while(*ptr != '"') ptr++;
+        
+        strncpy(filenames[i],ptr2,ptr-ptr2);
+        
+        ptr = strstr(ptr,"dataRef");
+        ptr2 = ptr+12;
+        ptr=ptr+12+SHA1_LENGTH;
+        strncpy(sha1s[i],ptr2,ptr-ptr2);
+        
+        puts(filenames[i]);
+        puts(sha1s[i]);
+    }
+    
+    //********************************************************************************************************
+    //********************************************************************************************************
+    //********************************************************************************************************    
+    
+    while (section != NULL) {
+        
+     //   switch (section->type) {
+       //     case LFP_RAW_IMAGE:
+                buf = converted_image((unsigned char *)section->data, &buflen, section->len);
+                if (buf) {
+                    int i=0;
+                    while(strcmp(sha1s[i],section->sha1)) ++i;
+                    
+                    snprintf(name, STRING_LENGTH, "%s", filenames[i]);
+                    if (save_data(buf, buflen, name))
+                        printf("Saved %s\n", name);
+                    free(buf);
+                }
+        //        break;
+         /*   default:
+                i=0;
+                while(strcmp(sha1s[i],section->sha1)) ++i;
+                
+                snprintf(name, STRING_LENGTH, "%s", filenames[i]);
+                if (save_data(section->data, section->len, name))
+                    printf("Saved %s\n", name);              
+                break;
+        }  */  
+        section = section->next;
+    }
+ 
 }
 
 static void lfp_close(lfp_file_p lfp)
@@ -326,7 +391,7 @@ int main(int argc, char *argv[])
 {
     char *period = NULL;
     lfp_file_p lfp = NULL;
-
+    
     if (argc < 2) {
         fprintf(stderr, "Usage: lfpsplitter file.lfp\n");
         return 1;
@@ -351,7 +416,7 @@ int main(int argc, char *argv[])
     }
     period = strrchr(lfp->filename,'.');
     if (period) *period = '\0';
-
+    
     lfp_parse_sections(lfp);
     
     lfp_save_sections(lfp);
